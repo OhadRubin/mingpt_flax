@@ -330,14 +330,16 @@ def train_step(state, input_idxs, targets, dropout_rng, axis='device'):
     def compute_loss(params):
         logits = state.apply_fn(dict(params=params), input_idxs, deterministic=False, rngs={"dropout":dropout_rng})
         loss = optax.softmax_cross_entropy_with_integer_labels(logits,targets)
-        return jnp.mean(loss)
+        # label_logits = jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0]
+        acc = (targets==logits.argmax(-1)).astype(jnp.float32)
+        return jnp.mean(loss),jnp.mean(acc,axis=0)
 
-    loss, grad = jax.value_and_grad(compute_loss)(state.params)
-    loss, grad = jax.lax.pmean([loss, grad], axis)
+    (loss, acc), grad = jax.value_and_grad(compute_loss,has_aux=True)(state.params)
+    loss, grad, acc = jax.lax.pmean([loss, grad, acc], axis)
 
     new_state = state.apply_gradients(grads=grad)
 
-    return loss, new_state, new_dropout_rng
+    return loss, acc, new_state, new_dropout_rng
 
 def eval_step(state, input_idxs, targets, dropout_rng, axis='device'):
     dropout_rng, new_dropout_rng = jax.random.split(dropout_rng, 2)
@@ -352,13 +354,14 @@ def eval_step(state, input_idxs, targets, dropout_rng, axis='device'):
     
 from flax import jax_utils
 from flax.training.common_utils import shard
-def collate_fn(batch):
-  targets = [x['targets'] for x in batch]
-  input_tokens = [x['input_tokens'] for x in batch]
-  targets = np.stack([np.pad(x,((0,1024-len(x))),constant_values=2) for x in targets])
-  input_tokens = np.stack([np.pad(x,((0,1024-len(x))),constant_values=2) for x in input_tokens])
-  return shard([input_tokens, targets])
 
+
+
+def calc_acc(logits, input_ids):
+    shift_labels = input_ids[..., 1:]
+    shift_logits = logits[..., :-1, :].argmax(-1)
+    acc = (shift_labels==shift_logits).type(jnp.float32)
+    return acc
 
 class Trainer:
 
@@ -466,7 +469,11 @@ class Trainer:
         self.iter_num = 0
         self.iter_time = time.time()
         pbar = tqdm()
-        loss_metric = RollingAverage.create(size=200)
+        loss_metric = RollingAverage.create(size=20)
+        acc0_metric = RollingAverage.create(size=20)
+        acc1_metric = RollingAverage.create(size=20)
+        acc2_metric = RollingAverage.create(size=20)
+        acc3_metric = RollingAverage.create(size=20)
 
         while True:
             pbar.update(1)
@@ -476,12 +483,24 @@ class Trainer:
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
             
-            loss, state, dropout_rngs = p_train_step(state, *batch, dropout_rngs)
-            loss = jax.device_get(loss)
+            loss,acc, state, dropout_rngs = p_train_step(state, *batch, dropout_rngs)
+            loss,acc = jax.device_get((loss,acc))
+            
+            acc_pos_num = acc.shape[-1]
+            acc = acc.reshape([-1,acc_pos_num]).mean(0)
+            num_buckets = 4
+            acc = acc[-(num_buckets*(acc_pos_num//num_buckets)):]
+            acc_per_pos = acc.reshape([num_buckets,acc_pos_num//num_buckets]).mean(1)
+            acc0,acc1,acc2,acc3 = acc_per_pos
 
             curr_loss,loss_metric = loss_metric.update(loss.mean().item())
-            
-            pbar.set_description(f"Curr loss: {curr_loss}")
+            curr_acc0,acc0_metric = acc0_metric.update(acc0.mean().item())
+            curr_acc1,acc1_metric = acc1_metric.update(acc1.mean().item())
+            curr_acc2,acc2_metric = acc2_metric.update(acc2.mean().item())
+            curr_acc3,acc3_metric = acc3_metric.update(acc3.mean().item())
+            #only show 2 decimal places
+            # pbar.set_description(f"Curr loss: {curr_loss} Curr acc0: {curr_acc0} Curr acc1: {curr_acc1} Curr acc2: {curr_acc2} Curr acc3: {curr_acc3}")
+            pbar.set_description(f"Curr loss: {curr_loss:.3f} Curr acc0: {curr_acc0:.3f} Curr acc1: {curr_acc1:.3f} Curr acc2: {curr_acc2:.3f} Curr acc3: {curr_acc3:.3f}")
             self.trigger_callbacks('on_batch_end')
             self.iter_num += 1
             tnow = time.time()
@@ -559,25 +578,91 @@ def batched_parallel(dataset):
         yield from flatten_input_ids(x)
 
 
-def get_dataset():
 
-    dataset = load_dataset("parquet",
-                        data_files={"train":"/home/ohadr/dpr_jax/etc/c4-ice-in-pita-000-of-128.parquet"},
-                           streaming=True
-                        )
+import numpy as np
+import pandas as pd
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def generate_sentences(sentence_lengths, word_distributions,topics,topic_idx_map):
+    sentences = []
+    vocab_size = word_distributions.shape[-1]
+    sentence_topics = []
+    for length, distribution,topic_idx in zip(sentence_lengths, word_distributions, topics):
+        # Generate a sentence of 'length' words
+        sentence = np.random.choice(vocab_size, length, p=distribution)
+        sentences.extend(sentence)
+        sentences.append(topic_idx_map[topic_idx])
+        sentence_topics.extend([topic_idx] * length)
+
+
+    return sentences, sentence_topics
+
+def np_softmax(
+    x,
+    axis  = -1,
+    where = None,
+    initial = 0):
+  x_max = np.max(x, axis, keepdims=True)
+  unnormalized = np.exp(x - x_max)
+  result = unnormalized / np.sum(unnormalized, axis, keepdims=True)
+  return result
+
+def sample_sequence(generator,n_sentences= 256, average_sentence_length = 5, dim_size=256, n_topics=64):
+    vocab_size = 32
+    topic_idx_map = {i:i+n_topics for i in range(n_topics)}
+    topic_vectors = generator.normal(0,1,[n_topics,dim_size])
+    word_emb = generator.normal(0,1,[vocab_size,dim_size])
+    word_distributions_topic = np_softmax(topic_vectors@word_emb.T/10)
+    topic_idx_sample = generator.integers(n_topics,size=[n_sentences])
+    word_distributions_per_sentence = word_distributions_topic[topic_idx_sample]
+    # sentence_lengths = np.random.poisson(average_sentence_length, n_sentences)
+    sentence_lengths = [average_sentence_length for _ in range(n_sentences)]
+    words, topics = generate_sentences(sentence_lengths,
+                                       word_distributions_per_sentence,
+                                       topic_idx_sample,
+                                       topic_idx_map=topic_idx_map)
+    return np.array(words), generator
+
+from datasets import IterableDataset
+
+
+def collate_fn(batch):
+  targets = [x['targets'] for x in batch]
+  input_tokens = [x['input_tokens'] for x in batch]
+  targets = np.stack(targets)
+  input_tokens = np.stack(input_tokens)
+  return shard([input_tokens, targets])
+def get_dataset():
+    def gen(seed):
+        generator = np.random.default_rng(seed)
+        while True:
+            input_ids,generator  = sample_sequence(generator)
+            targets = shift_right_by_one(input_ids)
+            yield {"input_tokens":input_ids,"targets":targets}
+    dataset = IterableDataset.from_generator(gen,gen_kwargs={"seed":42})
     print(dataset)
-    train_dataset = iter(dataset["train"])
-    train_dataset = batched_parallel(train_dataset)
-    train_dataset = BufferShuffledExamplesIterable(tqdm(train_dataset,desc="prefetching"), buffer_size=10000, generator=np.random.default_rng(42))
+    if isinstance(dataset,dict):
+        dataset = dataset["train"]
+    train_dataset = iter(dataset)
+    # train_dataset = batched_parallel(train_dataset)
+    # train_dataset = BufferShuffledExamplesIterable(tqdm(train_dataset,desc="prefetching"), buffer_size=10000, generator=np.random.default_rng(42))
     train_dataset = IterableDatasetWrapper(train_dataset)
     return train_dataset
 
 
+
+import numpy as np
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+    
 def go():
     model_config = GPT.get_default_config()
     model_config.model_type = 'gpt2'
-    model_config.vocab_size = 50257 # openai's model vocabulary
-    model_config.block_size = 1024  # openai's model block_size (i.e. input context length)
+    model_config.vocab_size = 512 # openai's model vocabulary
+    model_config.block_size = 4096  # openai's model block_size (i.e. input context length)
     model_config = setup_config(model_config)
     model = GPT(model_config)
 
